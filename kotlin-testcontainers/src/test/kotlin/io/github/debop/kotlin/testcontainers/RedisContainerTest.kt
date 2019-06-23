@@ -6,6 +6,7 @@ import io.lettuce.core.RedisFuture
 import io.lettuce.core.api.async.RedisAsyncCommands
 import io.lettuce.core.api.reactive.RedisReactiveCommands
 import io.lettuce.core.api.sync.RedisCommands
+import mu.KLogging
 import org.amshove.kluent.shouldBeNull
 import org.amshove.kluent.shouldEqual
 import org.junit.jupiter.api.AfterAll
@@ -15,7 +16,45 @@ import java.time.Duration
 
 class RedisContainerTest {
 
-    val redisServer: RedisContainer = RedisContainer.instance
+    companion object: KLogging() {
+        val redisServer: RedisContainer = RedisContainer.instance
+
+        fun RedisClient.withCommands(block: RedisCommands<String, String>.() -> Unit) {
+            connect().use {
+                block.invoke(it.sync())
+            }
+        }
+
+        fun RedisClient.withAsyncCommands(block: RedisAsyncCommands<String, String>.() -> Unit) {
+            val connection = connect()
+            try {
+                block.invoke(connection.async())
+            } finally {
+                connection.closeAsync().get()
+            }
+        }
+
+        fun RedisClient.withReactiveCommands(block: RedisReactiveCommands<String, String>.() -> Unit) {
+            connect().use {
+                block.invoke(it.reactive())
+            }
+        }
+
+        fun <T> RedisClient.withBatch(duration: Duration = Duration.ofSeconds(30),
+                                      block: RedisAsyncCommands<String, String>.() -> List<RedisFuture<T>>): List<T> {
+            connect().use { connection ->
+                val commands = connection.async()
+                commands.setAutoFlushCommands(false)
+
+                val futures = block.invoke(commands)
+
+                commands.flushCommands()
+                LettuceFutures.awaitAll(duration, *futures.toTypedArray())
+                return futures.map { future -> future.get() }
+            }
+        }
+    }
+
     lateinit var redisClient: RedisClient
 
     @BeforeAll
@@ -31,44 +70,10 @@ class RedisContainerTest {
         redisServer.close()
     }
 
-    private fun withCommands(block: RedisCommands<String, String>.() -> Unit) {
-        redisClient.connect().use {
-            block.invoke(it.sync())
-        }
-    }
-
-    private fun withAsyncCommands(block: RedisAsyncCommands<String, String>.() -> Unit) {
-        val connection = redisClient.connect()
-        try {
-            block.invoke(connection.async())
-        } finally {
-            connection.closeAsync().get()
-        }
-    }
-
-    private fun withReactiveCommands(block: RedisReactiveCommands<String, String>.() -> Unit) {
-        redisClient.connect().use {
-            block.invoke(it.reactive())
-        }
-    }
-
-    private fun <T> withBatch(duration: Duration = Duration.ofSeconds(30),
-                              block: RedisAsyncCommands<String, String>.() -> List<RedisFuture<T>>): List<T> {
-        redisClient.connect().use {
-            val commands = it.async()
-            commands.setAutoFlushCommands(false)
-
-            val futures = block.invoke(commands)
-
-            commands.flushCommands()
-            LettuceFutures.awaitAll(duration, *futures.toTypedArray())
-            return futures.map { future -> future.get() }
-        }
-    }
 
     @Test
     fun `connect to redis server`() {
-        withCommands {
+        redisClient.withCommands {
             set("sync-key", "sync-value")
             val actual = get("sync-key")
             actual shouldEqual "sync-value"
@@ -77,7 +82,7 @@ class RedisContainerTest {
 
     @Test
     fun `using asynchronous command`() {
-        withAsyncCommands {
+        redisClient.withAsyncCommands {
             set("async-key", "async-value").get()
 
             get("async-key").whenComplete { v, e ->
@@ -91,9 +96,8 @@ class RedisContainerTest {
 
     @Test
     fun `using reactive command`() {
-        withReactiveCommands {
+        redisClient.withReactiveCommands {
             set("reactive-key", "reactive-value").subscribe()
-
             get("reactive-key")
                 .subscribe {
                     it shouldEqual "reactive-value"
@@ -104,15 +108,9 @@ class RedisContainerTest {
     @Test
     fun `execute in batch`() {
         val batchSize = 100
-
-        val results = withBatch(Duration.ofMinutes(1)) {
-
-            List(batchSize) { index ->
-                set("batch-key-$index", "batch-value-$index")
-            }
-                .toList()
+        val results = redisClient.withBatch(Duration.ofMinutes(1)) {
+            List(batchSize) { set("batch-key-$it", "batch-value-$it") }.toList()
         }
-
         results.size shouldEqual batchSize
     }
 }

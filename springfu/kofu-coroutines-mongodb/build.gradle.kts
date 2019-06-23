@@ -2,7 +2,6 @@ plugins {
     id("org.springframework.boot") version Versions.spring_boot
 }
 
-
 dependencies {
     api(project(":kotlin-testcontainers"))
 
